@@ -1,0 +1,121 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk21'
+        
+    }
+
+    environment {
+        
+        DOCKER_NAME  = 'harishnshetty/adservice'
+        IMAGE_NAME   = 'adservice'
+    }
+
+    stages {
+        stage("Clean Workspace") {
+            steps { cleanWs() }
+        }
+
+        stage("Git Checkout") {
+            steps {
+                git branch: 'main', url: 'https://github.com/harishnshetty/Google-microservices-devsecops-project.git'
+            }
+        }
+
+
+
+
+        // --- Trivy FS Scan ---
+        stage("Trivy File Scan") {
+            steps {
+                dir('src/adservice') {
+                    sh '''
+                    trivy fs . --severity CRITICAL,HIGH --exit-code 1 --scanners vuln,misconfig,secret > trivy-fs-report.txt || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts 'src/adservice/trivy-fs-report.txt'
+                }
+            }
+        }
+
+        // --- Build Docker Image ---
+        stage("Build Docker Image") {
+            steps {
+                dir('src/adservice') {
+                    script {
+                        env.IMAGE_TAG = "$DOCKER_NAME:${BUILD_NUMBER}"
+                        sh "docker rmi -f $IMAGE_NAME ${env.IMAGE_TAG} || true"
+                        sh "docker build -t $IMAGE_NAME ."
+                        sh "docker tag $IMAGE_NAME ${env.IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+
+        // --- Push Docker Image ---
+        stage("Push to DockerHub") {
+            steps {
+                dir('src/adservice') {
+                    withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
+                        sh '''
+                        docker login -u harishnshetty -p ${dockerpwd}
+                        docker push ${IMAGE_TAG}
+                        docker tag ${IMAGE_NAME} ${DOCKER_NAME}:latest
+                        docker push ${DOCKER_NAME}:latest
+                        '''
+                    }
+                }
+            }
+        }
+
+        // --- Trivy Image Scan ---
+        // stage("Trivy Scan Image") {
+        //     steps {
+        //         dir('src/adservice') {
+        //             sh '''
+        //             trivy image -f json -o trivy-image-ad.json ${IMAGE_TAG}
+        //             trivy image -f table -o trivy-image-ad.txt ${IMAGE_TAG}
+        //             '''
+        //         }
+        //     }
+        //     post {
+        //         always {
+        //             archiveArtifacts 'src/adservice/trivy-image-ad.*'
+        //         }
+        //     }
+        // }
+    }
+
+    // --- Final Notifications ---
+    post {
+        always {
+            dir('src/adservice') {
+                script {
+                    def buildStatus = currentBuild.currentResult
+                    def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: ' Github User'
+
+                    emailext (
+                        subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <p>Adservice Google-Shop DevSecOps pipeline status.</p>
+                            <p>Youtube Link :- https://www.youtube.com/@devopsHarishNShetty </p>
+                            <p>Project: ${env.JOB_NAME}</p>
+                            <p>Build Number: ${env.BUILD_NUMBER}</p>
+                            <p>Build Status: ${buildStatus}</p>
+                            <p>Started by: ${buildUser}</p>
+                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        """,
+                        to: 'harishn662@gmail.com',
+                        from: 'harishn662@gmail.com',
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'dependency-check-report.xml,trivy-fs-report.txt,trivy-image-ad.json,trivy-image-ad.txt'
+                    )
+                }
+            }
+        }
+    }
+}

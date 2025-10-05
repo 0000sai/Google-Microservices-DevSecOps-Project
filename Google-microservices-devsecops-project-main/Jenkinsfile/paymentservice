@@ -1,0 +1,176 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk17'
+        nodejs 'node20'
+    }
+    
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_NAME  = 'harishnshetty/paymentservice'
+        IMAGE_NAME   = 'paymentservice'
+    }
+
+    stages {
+        stage("Clean Workspace") {
+            steps { cleanWs() }
+        }
+
+        stage("Git Checkout") {
+            steps {
+                git branch: 'main', url: 'https://github.com/harishnshetty/Google-microservices-devsecops-project.git'
+            }
+        }
+
+        // --- SAST: SonarQube for Node.js ---
+        stage("SonarQube Analysis") {
+            steps {
+                dir('src/paymentservice') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh '''
+                        $SCANNER_HOME/bin/sonar-scanner \
+                          -Dsonar.projectKey=paymentservice \
+                          -Dsonar.projectName=paymentservice \
+                          -Dsonar.sources=. \
+                          -Dsonar.language=js
+                        '''
+                    }
+                }
+            }
+        }
+
+        // --- Quality Gate ---
+        stage("Quality Gate") {
+            steps {
+                script {
+                    timeout(time: 3, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token'
+                    }
+                }
+            }
+        }
+
+        // --- Install Dependencies ---
+        stage("Install Dependencies") {
+            steps {
+                dir('src/paymentservice') {
+                    sh "npm install"
+                }
+            }
+        }
+
+          stage("OWASP FS Scan") {
+            steps {
+                dir('src/paymentservice') {
+                dependencyCheck additionalArguments: '''
+                    --scan ./ 
+                    --disableYarnAudit 
+                    --disableNodeAudit 
+                
+                   ''',
+                odcInstallation: 'dp-check'
+
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+                    post {
+                always {
+                    archiveArtifacts 'src/paymentservice/dependency-check-report.xml'
+                }
+            }
+          }
+
+        // --- Trivy FS Scan ---
+        stage("Trivy File Scan") {
+            steps {
+                dir('src/paymentservice') {
+                    sh '''
+                    trivy fs . --severity CRITICAL,HIGH --exit-code 1 --scanners vuln,misconfig,secret > trivy-fs-report.txt || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts 'src/paymentservice/trivy-fs-report.txt'
+                }
+            }
+        }
+
+        // --- Build Docker Image ---
+        stage("Build Docker Image") {
+            steps {
+                dir('src/paymentservice') {
+                    script {
+                        env.IMAGE_TAG = "$DOCKER_NAME:${BUILD_NUMBER}"
+                        sh "docker rmi -f $IMAGE_NAME ${env.IMAGE_TAG} || true"
+                        sh "docker build -t $IMAGE_NAME ."
+                        sh "docker tag $IMAGE_NAME ${env.IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+
+        // --- Push Docker Image ---
+        stage("Push to DockerHub") {
+            steps {
+                dir('src/paymentservice') {
+                    withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
+                        sh '''
+                        docker login -u harishnshetty -p ${dockerpwd}
+                        docker push ${IMAGE_TAG}
+                        docker tag ${IMAGE_NAME} ${DOCKER_NAME}:latest
+                        docker push ${DOCKER_NAME}:latest
+                        '''
+                    }
+                }
+            }
+        }
+
+        // --- Trivy Image Scan ---
+        stage("Trivy Scan Image") {
+            steps {
+                dir('src/paymentservice') {
+                    sh '''
+                    trivy image -f json -o trivy-image-currency.json ${IMAGE_TAG}
+                    trivy image -f table -o trivy-image-currency.txt ${IMAGE_TAG}
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts 'src/paymentservice/trivy-image-currency.*'
+                }
+            }
+        }
+    }
+
+    // --- Final Notifications ---
+    post {
+        always {
+            dir('src/paymentservice') {
+                script {
+                    def buildStatus = currentBuild.currentResult
+                    def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: ' Github User'
+
+                    emailext (
+                        subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <p>paymentservice Google-Shop DevSecOps pipeline status.</p>
+                            <p>Youtube Link :- https://www.youtube.com/@devopsHarishNShetty </p>
+                            <p>Project: ${env.JOB_NAME}</p>
+                            <p>Build Number: ${env.BUILD_NUMBER}</p>
+                            <p>Build Status: ${buildStatus}</p>
+                            <p>Started by: ${buildUser}</p>
+                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        """,
+                        to: 'harishn662@gmail.com',
+                        from: 'harishn662@gmail.com',
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'trivy-fs-report.txt,trivy-image-currency.json,trivy-image-currency.txt,dependency-check-report.xml'
+                    )
+                }
+            }
+        }
+    }
+}

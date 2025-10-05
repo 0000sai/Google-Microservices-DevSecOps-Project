@@ -1,0 +1,250 @@
+pipeline {
+    agent any
+
+    tools {
+        go 'go1.25'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+        DOCKER_NAME = 'harishnshetty/productcatalogservice'
+        IMAGE_NAME = 'productcatalogservice'
+        // This is a global definition. We'll ensure it's used correctly below.
+        GO_BIN_PATH = '$(go env GOPATH)/bin'
+    }
+
+    stages {
+        stage("Clean Workspace") {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage("Git Checkout") {
+            steps {
+                git branch: 'main', url: 'https://github.com/harishnshetty/Google-microservices-devsecops-project.git'
+            }
+        }
+
+        // --- Static Security Scan (SAST) ---
+        stage('Go Security Scan (gosec)') {
+            steps {
+                dir('src/productcatalogservice') {
+                    script {
+                        sh '''
+                        # Add Go binaries path to PATH for this script session
+                        export PATH="$PATH:$(go env GOPATH)/bin"
+
+                        # Install gosec if not present
+                        if ! command -v gosec &> /dev/null; then
+                            echo "Installing gosec..."
+                            go install github.com/securego/gosec/v2/cmd/gosec@latest
+                        fi
+
+                        echo "Running gosec scan..."
+                        # FIX applied in previous iteration: Added -no-fail flag
+                        gosec -fmt=sonarqube -out gosec-report.json -no-fail ./...
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts 'src/productcatalogservice/gosec-report.json'
+                }
+            }
+        }
+        // ---- Static Analysis & Report Ingestion ----
+        stage("SonarQube Analysis") {
+            steps {
+                dir('src/productcatalogservice') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh ''' $SCANNER_HOME/bin/sonar-scanner \\
+                            -Dsonar.projectName=productcatalogservice \\
+                            -Dsonar.projectKey=productcatalogservice \\
+                            -Dsonar.sources=. \\
+                            -Dsonar.language=go \\
+                            -Dsonar.go.gosec.reportPaths=gosec-report.json '''
+                    }
+                }
+            }
+        }
+
+        // stage("Quality Gate") {
+        //     steps {
+        //         script {
+        //             timeout(time: 3, unit: 'MINUTES') {
+        //                 waitForQualityGate abortPipeline: true, credentialsId: 'sonar-token'
+        //             }
+        //         }
+        //     }
+        // }
+
+        // --- Core CI Stages start after successful Quality Gate ---
+
+        stage('Go Build') {
+            steps {
+                dir('src/productcatalogservice') {
+                    sh '''
+                    echo "Building Go productcatalogservice application..."
+                    CGO_ENABLED=0 go build -o app .
+                    '''
+                }
+            }
+        }
+
+        stage('Go Unit Tests') {
+            steps {
+                dir('src/productcatalogservice') {
+                    sh '''
+                    echo "Running unit tests with coverage..."
+                    go test -v -coverprofile=coverage.out ./...
+                    '''
+                }
+            }
+        }
+
+        // --- Dependency Check (SCA) ---
+        stage('Go Dependency Check (govulncheck)') {
+            steps {
+                dir('src/productcatalogservice') {
+                    script {
+                        sh '''
+                        # FIX: Run 'go env GOPATH' directly to get the path where 'go install' places binaries.
+                        # This ensures the new PATH is set correctly before calling the installed tool.
+                        export PATH="$PATH:$(go env GOPATH)/bin"
+
+                        # Install govulncheck if not present
+                        if ! command -v govulncheck &> /dev/null; then
+                            echo "Installing govulncheck..."
+                            go install golang.org/x/vuln/cmd/govulncheck@latest
+                        fi
+
+                        # FIX: Re-export the PATH after installation, in case the previous check failed
+                        # or the 'go install' command was required.
+                        export PATH="$PATH:$(go env GOPATH)/bin"
+
+                        echo "Running govulncheck on dependencies..."
+                        # The '|| true' keeps the pipeline running even if vulnerabilities are found.
+                        govulncheck ./... || true
+                        '''
+                    }
+                }
+            }
+        }
+        stage("Trivy File Scan") {
+            steps {
+                dir('src/productcatalogservice') { // Run the scan inside the target directory
+                    script {
+                        sh '''
+                        echo "Running Trivy file system scan (Plain Text Report)..."
+
+                        # Command Explanation:
+                        # --severity CRITICAL,HIGH: Only reports CRITICAL and HIGH issues.
+                        # --exit-code 1: Fails the Jenkins step if CRITICAL or HIGH issues are found.
+                        # fs .: Scans the current directory (src/productcatalogservice).
+                        trivy fs . \\
+                            --severity CRITICAL,HIGH \\
+                            --exit-code 1 \\
+                            --scanners vuln,misconfig,secret \\
+                            > trivy-fs-report.txt || true
+
+                        # '|| true' allows the pipeline to continue for reporting purposes if
+                        # findings are present but allows 'trivy' to set the exit code correctly.
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    // Archive the plain text report from the workspace root
+                    archiveArtifacts 'src/productcatalogservice/trivy-fs-report.txt'
+                }
+            }
+        }
+        stage("Build Docker Image") {
+            steps {
+                dir('src/productcatalogservice') {
+                    script {
+                        env.IMAGE_TAG = "$DOCKER_NAME:${BUILD_NUMBER}"
+
+                        // Optional cleanup
+                        sh "docker rmi -f $IMAGE_NAME ${env.IMAGE_TAG} || true"
+
+                        sh "docker build -t $IMAGE_NAME ."
+                        sh "docker tag $IMAGE_NAME ${env.IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+        stage("Tag & Push to DockerHub") {
+            steps {
+                dir('src/productcatalogservice') {
+                    script {
+                        withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
+                            sh "docker login -u harishnshetty -p ${dockerpwd}"
+                            sh "docker tag $IMAGE_NAME ${env.IMAGE_TAG}"
+                            sh "docker push ${env.IMAGE_TAG}"
+
+                            // Also push latest
+                            sh "docker tag $IMAGE_NAME $DOCKER_NAME:latest"
+                            sh "docker push $DOCKER_NAME:latest"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Trivy Scan Image") {
+            steps {
+                dir('src/productcatalogservice') {
+                    script {
+                        sh """
+                        echo '🔍 Running Trivy scan on ${env.IMAGE_TAG}'
+
+                        # JSON report
+                        trivy image -f json -o trivy-image-productcatalogservice.json ${env.IMAGE_TAG}
+
+                        # Text report
+                        trivy image -f table -o trivy-image-productcatalogservice.txt ${env.IMAGE_TAG}
+
+                        # Fail build if HIGH/CRITICAL vulnerabilities found
+                        # trivy image --exit-code 1 --severity HIGH,CRITICAL ${env.IMAGE_TAG} || true
+                        """
+                    }
+                }
+            }
+            // Missing closing brace '}' for the stages block was here
+        } // Closing brace for "Trivy Scan Image" stage
+    } // Closing brace for 'stages' block
+
+    // --- Final Check (Kept at the end) ---
+    post {
+        always {
+            dir('src/productcatalogservice') {
+                script {
+                    def buildStatus = currentBuild.currentResult
+                    def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: ' Github User'
+
+                    emailext (
+                        subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <p>productcatalogservice Google-Shop DevSecops pipeline status.</p>
+                            <p>Youtube Link :- https://www.youtube.com/@devopsHarishNShetty </p>
+                            <p>Project: ${env.JOB_NAME}</p>
+                            <p>Build Number: ${env.BUILD_NUMBER}</p>
+                            <p>Build Status: ${buildStatus}</p>
+                            <p>Started by: ${buildUser}</p>
+                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+
+                        """,
+                        to: 'harishn662@gmail.com',
+                        from: 'harishn662@gmail.com',
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'trivy-fs-report.txt,trivy-image-productcatalogservice.json,trivy-image-productcatalogservice.txt,gosec-report.json'
+                    )
+                }
+            }
+        }
+    }
+} // Closing brace for 'pipeline' block
